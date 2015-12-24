@@ -1,13 +1,13 @@
-/**************************************************************************************
+/*************************************************************************************
 
     Battery-powered remote wireless temperature sensor
 
   This is the software for a small (3" x 3" x 1") battery-powered wireless sensor
-  that measure temperature (and humidity), displays it on a 2-digit LCD screen,
+  that measures temperature (and humidity), displays it on a 2-digit LCD screen,
   and periodically sends it to a receiver that digitally simulates the resistance
-  of a thermistor inside a Mitsubishi thermostate at the temperature the sensor.
+  of a thermistor inside up to four Mitsubishi thermostats.
 
-  The custom-built hardware consist of:
+  The custom-built sensor hardware consist of:
   - Teensy LC microcontroller from www.pjrc.com
   - Seeed HC-12 433 Mhz RF transceiver from www.seeedstudio.com
   - Varitronix VI-201 2-digit 7-segment LCD display
@@ -41,21 +41,23 @@
   --------------------------------------------------------------------------
   Change log
 
-  11 Nov 2015, V1.0, L. Shustek, First version
-  30 Nov 2015, V1.1, L. Shustek, add retry for HC-12 errors
+  11 Nov 2015, V1.0, L. Shustek, First version.
+  30 Nov 2015, V1.1, L. Shustek, Add retry for HC-12 errors.
+  19 Dec 2015, V1.2, L. Shustek, Use zone 1..4 in displays.
+                                 Read addr switches before going into sleep mode.
 
 *************************************************************************************/
 
-#define DEBUG 0
+#define DEBUG 0     // monitor window debugging
+#define TESTS 0     // miscellaneous tests
 
-#define DEEP_SLEEP 1
-#define HIBERNATE 1
-#define TESTS 0
+#define TRANSMIT 1    // allow transmitting
+#define DEEP_SLEEP 1  // allow "deep sleep" for normal waits
+#define HIBERNATE 1   // allow "hibernation" for catatonic waits when the transmitter is idle
 
 #include <arduino.h>
 #include <Snooze.h>
 #include <Wire.h>
-
 
 SnoozeBlock sleep_config;
 
@@ -63,7 +65,7 @@ SnoozeBlock sleep_config;
 
 struct {
   byte stx;         // STX=0x02
-  byte addr;        // our address
+  byte addr;        // our address, 0..3 (displayed and set as 1..4)
   byte type;        // this message type: 1
   byte temperature; // temperature in degrees F, 0 to 120
   byte humidity;    // humidity in percent, 0..100
@@ -85,14 +87,13 @@ unsigned long count_sent_packets = 0;
 #define LCD_DIGIT1_SEGMENTS GPIOC_PDOR  // all of register D are digit 1 segments
 #define LCD_DIGIT2_SEGMENTS GPIOD_PDOR  // all of register C are digit 2 segments
 #define LCD_DIGIT_COM  3                // common for both digits
-
 byte lcd_pins[] = {
   2, 14, 7, 8, 6, 20, 21, 5,
   15, 22, 23, 9, 10, 13, 11, 12,
   LCD_DIGIT_COM
 }; // note that pin 13 (PTC5) is attached to a LED on the Teensy board that should be removed to save power
 
-byte digit_segments[11] = { // bit map of segments to light up, with A as LSB, for 0-9 and 'E'
+byte digit_segments[11] = { // bit map of segments to light up, with top segment A as the LSB, for 0-9 and 'E'
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x79
 };
 #define POINT1 1
@@ -101,10 +102,10 @@ byte digit_segments[11] = { // bit map of segments to light up, with A as LSB, f
 
 // address and mode slide switches
 
-#define SW1 16
-#define SW2 17  // (something's wrong with this -- always zero???)
+#define SW1 16  //leftmost;  we read "on" as a zero
+#define SW2 17  // (weird: pin 17 is always zero after we've used deep sleep mode!) 
 #define SW3 24
-#define SW4 25
+#define SW4 25  //rightmost
 
 // temperature/humidity sensor: Adafruit's breakout board for the TI HDC1008
 
@@ -131,7 +132,9 @@ byte digit_segments[11] = { // bit map of segments to light up, with A as LSB, f
 uint16_t current_temp;    // degrees F
 uint16_t current_humid;   // percent, 0..100
 
-// processoer sleep modes, using the "Snooze" library at https://github.com/duff2013/Snooze
+//-----------------------------------------------------------------------------------------------------------------
+// processor sleep modes, using the "Snooze" library at https://github.com/duff2013/Snooze
+//-----------------------------------------------------------------------------------------------------------------
 
 #if DEEP_SLEEP && !DEBUG  // use this while RF transmitter is alive
 void sleep_delay(int milliseconds) { // delay in deep sleep; power consumption is about 230 uA
@@ -139,7 +142,7 @@ void sleep_delay(int milliseconds) { // delay in deep sleep; power consumption i
   Snooze.deepSleep(sleep_config);
 }
 #else
-#define sleep_delay delay   // (going into sleep mode kills the USB connection to the monitor window)
+#define sleep_delay delay   // (going into sleep mode kills the USB connection to the debugging monitor window)
 #endif
 
 #if HIBERNATE && !DEBUG  // ok to use when the RF transmitter is sleeping
@@ -171,10 +174,7 @@ uint16_t HDC1000_read16(uint8_t a) {
   Wire.endTransmission();
   hibernate_delay(2);
   Wire.requestFrom(HDC1000_I2CADDR, (uint8_t)2);
-  uint16_t r = Wire.read();
-  r <<= 8;
-  r |= Wire.read();
-  return r;
+  return (Wire.read() << 8) | Wire.read();
 }
 boolean HDC1000_begin(void) {
   Wire.begin();
@@ -239,6 +239,10 @@ void shownum (byte num, byte points, int time) { // display 2-digit number, or "
   LCD_DIGIT2_SEGMENTS = 0;
 }
 void fatal_error (int errnum) {   // become catatonic with flashing error number "En"
+  // 1: can't start RF transmitter
+  // 2: can't wake RF transmitter
+  // 3: can't start temperature sensor
+  // 4: bad address in switches
   while (1) {
     shownum(100 + errnum, NOPOINTS, 500);
     hibernate_delay(500);
@@ -264,7 +268,7 @@ void send_command(const char *cmd) {
 bool get_response(const char *expected_rsp) {
   char response[50];
   byte response_length;
-  Serial1.setTimeout(50); // give it up to these many msec to process
+  Serial1.setTimeout(100); // give it up to these many msec to process
   response_length = Serial1.readBytes(response, sizeof(response) - 1);
   response[response_length] = '\0';
   if (DEBUG) {
@@ -289,17 +293,26 @@ bool get_response(const char *expected_rsp) {
 
 void setup() {
   int tries;
+  byte address_switches;
 
   if (DEBUG) {
     Serial.begin(115200);
     delay(1000);
     Serial.println("Sensor started.\n");
   }
+  else delay(1000);
+
+  analogReference(EXTERNAL);  // for battery voltage check, use external reference voltage
   pinMode(SW1, INPUT_PULLUP); // configure addr/mode switches
   pinMode(SW2, INPUT_PULLUP);
   pinMode(SW3, INPUT_PULLUP);
   pinMode(SW4, INPUT_PULLUP);
-  analogReference(EXTERNAL);  // for battery voltage check, use external reference voltage
+
+  // Switch 2 (pin 17/A3) will always read as zero after going into sleep mode because the
+  // Snooze library reconfigures it to output a zero to avoid turning on the 74V1T125 buffer.
+  // So we read the (active low) address/mode switches here, before ever using deep sleep.
+
+  address_switches = ( (digitalRead(SW3) << 1) | digitalRead(SW4)) ^ 0x03; // 0..3
 
   LCD_DIGIT1_SEGMENTS = 0; // initialize 2-digit display
   LCD_DIGIT2_SEGMENTS = 0;
@@ -312,45 +325,58 @@ void setup() {
       shownum(i * 10 + i + 1, NOPOINTS, 300);
     }
   }
-  HDC1000_begin(); // start current_temperature/humidity sensor
 
-  pinMode(HC12_SET, OUTPUT);  // start HC-12 RF transceiver
-  digitalWriteFast(HC12_SET, HIGH);
-  Serial1.begin(9600, SERIAL_8N1);
-  delay(10);
-  digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
-  delay(10);
-  tries = 1;
-  do {
-    if (++tries > 10) fatal_error(1); // E1 error
-    send_command("AT");  // wake it up
-    // That sometimes fails. When batteries are weak? Should we delay more, decrease the
-    // filter electrolytic capacitor, try a few times, or some combination of all of those?
-  } while (!get_response("OK\x0d\x0a")); // for now: try a bunch of times
-  //send_command("AT+DEFAULT");  // setting everything to default doesn't work if  FU1 follows!?!
-  //get_response(NULL);
-  send_command("AT+FU1"); // set FU1 mode: medium speed, 3.6 ma while active
-  get_response(NULL);
-  if (DEBUG) {
-    send_command("AT+V");  // get version number
+#if HIBERNATE && !DEBUG  // turn off peripherals we don't use
+  // This doesn't actually help very much, if at all...
+  sleep_config.setPeripheral = CMP_OFF;
+  sleep_config.setPeripheral = I2C0_OFF;
+  sleep_config.setPeripheral = UART2_OFF;
+  sleep_config.setPeripheral = UART3_OFF;
+#endif
+
+  if (!HDC1000_begin()) // start current_temperature/humidity sensor
+    fatal_error(3); // E3 error
+
+  if (TRANSMIT) {
+    pinMode(HC12_SET, OUTPUT);  // start HC-12 RF transceiver
+    digitalWriteFast(HC12_SET, HIGH);
+    Serial1.begin(9600, SERIAL_8N1);
+    delay(10);
+    digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
+    delay(10);
+    tries = 1;
+    do {
+      if (++tries > 10) fatal_error(1); // E1 error
+      send_command("AT");  // wake it up
+    } while (!get_response("OK\x0d\x0a")); // try a bunch of times
+    send_command("AT+DEFAULT");
     get_response(NULL);
-    send_command("AT+RX"); // get all parameters
+    send_command("AT+FU1"); // set FU1 mode: medium speed, 3.6 ma while active
     get_response(NULL);
+    send_command("AT+C001"); // set channel 001: 433.4 Mhz
+    get_response(NULL);
+    if (DEBUG) {
+      send_command("AT+V");  // get version number
+      get_response(NULL);
+      send_command("AT+RX"); // get all parameters
+      get_response(NULL);
+    }
+    digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
+    delay(100); // wait a bit
   }
-  digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
-  delay(100); // wait a bit
 
   packet.stx = STX;    // initialize the packet to send
   packet.etx = ETX;
-  packet.addr = ((digitalRead(SW3) << 1) | digitalRead(SW4)) ^ 0x03; // 0..3 unit address
-  for (int i = 0; i < 5; ++i) {  // flash our address a few times
-    shownum(packet.addr, NOPOINTS, 500);
+  if (address_switches > 3) fatal_error(4);
+  for (int i = 0; i < 5; ++i) {  // flash our 1..4 zone number a few times
+    shownum(address_switches + 1, NOPOINTS, 500);
     delay(500);
   }
   if (DEBUG) {
-    Serial.print("unit address: ");
-    Serial.println(packet.addr);
+    Serial.print("zone: ");
+    Serial.println(address_switches + 1);
   }
+  packet.addr = address_switches; // store the address as 0..3
   packet.type = 1;
 
   if (TESTS) {  // display battery test point voltage
@@ -364,8 +390,8 @@ void setup() {
         Serial.println(aval);
         Serial.println(volt_tenths);
       }
-      shownum(volt_tenths, POINT2, 1000); // voltage in tenths
-      delay(500);
+      shownum(volt_tenths, POINT2, 500); // voltage in tenths
+      delay(250);
     }
   }
 }
@@ -380,18 +406,21 @@ void loop() {
 
   // 1. Put the RF transmitter to sleep so it only uses about 22 uA of power
 
-  digitalWriteFast(HC12_SET, LOW); // enter command mode
-  sleep_delay(10);
-  send_command("AT"); // the first command is ignored!
-  get_response(NULL);
-  do {
+  if (TRANSMIT) {
+    digitalWriteFast(HC12_SET, LOW); // enter command mode
     sleep_delay(10);
-    send_command("AT+SLEEP");
-  } while (!get_response("OK+SLEEP\x0d\x0a")); // ... might get "ERROR\x0d\0xa" if busy, so keep trying
-  if (DEBUG) {
-    Serial.print("send took "); Serial.print(millis() - send_data_time); Serial.println(" msec");;
+    send_command("AT"); // the first command is ignored!
+    get_response(NULL);
+    do {
+      sleep_delay(10);
+      send_command("AT+SLEEP");
+    } while (!get_response("OK+SLEEP\x0d\x0a")); // ... might get "ERROR\x0d\0xa" if busy, so keep trying
+    if (DEBUG) {
+      Serial.print("send took "); Serial.print(millis() - send_data_time); Serial.println(" msec");;
+    }
+    digitalWriteFast(HC12_SET, HIGH);  // back to data mode
+    // hibernate_delay(10000); //TEMP  test power utilization
   }
-  digitalWriteFast(HC12_SET, HIGH);  // back to data mode
 
   // 2. Display the temperature for a while, uisng hibernation waits to minimize power drain
 
@@ -404,32 +433,34 @@ void loop() {
 
   // 3. Wake up the transmitter send a packet with the latest temperature
 
-  hibernate_delay (100 * packet.addr); // "random" delay based on our address, to minimize collisions
-  packet.temperature = min(max(current_temp, 0), 120);
-  packet.humidity = min(max(current_humid, 0), 100);
-  packet.battery = (uint32_t)analogRead(BATTERY_PIN) * AREF_MV / (1023 * 50); // VCC/2 resistor network!
-  packet.lrc = 0;
-  for (int i = 0; i < sizeof(packet) - 1; ++i) packet.lrc ^= ((byte *)(&packet))[i];
-  digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
-  // from here on we wait with the cpu in sleep mode instead of hibernate, to keep the
-  // transmitter active with the full 3.3V on the VDD pin
-  sleep_delay(10);
-  tries = 1;
-  do {
-    if (++tries > 10) fatal_error(2); // E2 error
-    send_command("AT");  // wake it up
-  } while (!get_response("OK\x0d\x0a")); // keep at it until it responds
-  digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
-  sleep_delay(50); // need this! 25 is not enough
-  if (DEBUG) {
-    Serial.print("send data packet #"); Serial.print(++count_sent_packets); Serial.print(": ");
-    for (int i = 0; i < sizeof(packet); ++i) {
-      Serial.print(((byte *)(&packet))[i], DEC);  Serial.print(' ');
+  if (TRANSMIT) {
+    hibernate_delay (100 * packet.addr); // "random" delay based on our address, to minimize collisions
+    packet.temperature = min(max(current_temp, 0), 120);
+    packet.humidity = min(max(current_humid, 0), 100);
+    packet.battery = (uint32_t)analogRead(BATTERY_PIN) * AREF_MV / (1023 * 50); // VCC/2 resistor network!
+    packet.lrc = 0;
+    for (int i = 0; i < sizeof(packet) - 1; ++i) packet.lrc ^= ((byte *)(&packet))[i];
+    digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
+    // from here on we wait with the cpu in sleep mode instead of hibernate, to keep the
+    // transmitter active with the full 3.3V on the VDD pin
+    sleep_delay(10);
+    tries = 1;
+    do {
+      if (++tries > 10) fatal_error(2); // E2 error
+      send_command("AT");  // wake it up
+    } while (!get_response("OK\x0d\x0a")); // keep at it until it responds
+    digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
+    sleep_delay(50); // need this! 25 is not enough
+    if (DEBUG) {
+      Serial.print("send data packet #"); Serial.print(++count_sent_packets); Serial.print(": ");
+      for (int i = 0; i < sizeof(packet); ++i) {
+        Serial.print(((byte *)(&packet))[i], DEC);  Serial.print(' ');
+      }
+      Serial.println();
     }
-    Serial.println();
+    Serial1.write((byte *)(&packet), sizeof(packet)); // send the packet data
+    Serial1.flush(); // wait for it all to go out
+    send_data_time = millis();
+    sleep_delay(10); // give it a time to start  ** was 50
   }
-  Serial1.write((byte *)(&packet), sizeof(packet)); // send the packet data
-  Serial1.flush(); // wait for it all to go out
-  send_data_time = millis();
-  sleep_delay(50); // give it a time to start
 }
