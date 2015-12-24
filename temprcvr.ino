@@ -48,10 +48,10 @@
 
   11 Nov 2015, V1.0, L. Shustek; first version
   29 Nov 2015, V1.1, L. Shustek; add pushbutton commands
+  14 Dec 2015, V1.2, L. Shustek; renumber to zones 1..4
 
 */
-
-#define VERSION "1.1"
+#define VERSION "1.2"
 
 #define DEBUG 1
 #define TESTS 0
@@ -61,8 +61,11 @@
 #include <LiquidCrystal.h>  // for LCD display
 #include <SPI.h>    // for digital pots using SPI
 #include <Wire.h>   // for realtime clock using I2C
+#include "IntervalTimer.h"
 
-#define SPEAKER 20    // speaker PWM pin
+#define SPEAKER_POS 20 // speaker pins
+#define SPEAKER_NEG 21
+
 #define HC12_SET 4    // RF transceiver "set" pin
 #define MODESW_1 22   // mode slide switch pins
 #define MODESW_2 23
@@ -77,12 +80,12 @@ LiquidCrystal lcd(/*RS*/ 5, /*E*/ 6, /*D4-D7*/ 7, 8, 9, 10);  // LCD pins
 #define SPI_MISO 12
 #define SPI_CLK 13
 #define LED 13  // (also connected to LED)
-#define SPI_CS1 14  // first two pots
-#define SPI_CS2 15  // second two pots
+#define SPI_CS1 14  // first two pots, IC U$2
+#define SPI_CS2 15  // second two pots, IC U$4
 
 struct {  // the packet we expect to receive
   byte stx;         // STX=0x02
-  byte zone;        // our address
+  byte addr;        // our address, 0...3, mapped to "zones" 1..4
   byte type;        // this message type: 1
   byte temperature; // temperature in degrees F, 1 to 120
   byte humidity;    // humidity in percent, 0..100
@@ -123,7 +126,7 @@ static const byte days_in_month []  = {
 
 #define PACKETLOG_SIZE 100
 struct { // the log of packets we record for debugging
-  byte zone;
+  byte addr; // 0..3
   byte temperature;
   byte battery;
   struct datetime timestamp;
@@ -133,7 +136,7 @@ int packetlog_index = 0; // next log array location to write
 
 #define ERRORLOG_SIZE 25
 struct { // the log of errors we record for debugging
-  byte zone;   // currently we only store "disconnect" events
+  byte addr;   // currently we only store "disconnect" events
   struct datetime timestamp;
 } error_log[ERRORLOG_SIZE];
 int errorlog_count = 0; // number of errors stored
@@ -148,17 +151,16 @@ void assert (boolean test, const char *msg) {
     lcd.clear();
     lcd.print("** INTERNAL ERROR **");
     lcd.setCursor(0, 1);
-    lcd.print("Assertion failed:");
+    lcd.print("assertion failed:");
     lcd.setCursor(0, 2);
     lcd.print(msg);
     while (true) ;
   }
 }
-
 void center_message (byte row, char *msg) {
   byte len, nblanks;
   len = strlen(msg);
-  assert (len <= 20, "bad center_message");
+  assert (len <= 20, "big center_message");
   nblanks = (20 - len) >> 1;
   lcd.setCursor(0, row);
   for (byte i = 0; i < nblanks; ++i) lcd.print(" ");
@@ -177,7 +179,6 @@ byte bcd2bin (byte val) {
 byte bin2bcd (byte val) {
   return val + 6 * (val / 10);
 }
-
 void rtc_read(struct datetime *dt) { // Read realtime clock data, in 12-hour mode
   byte hour;
   Wire.beginTransmission(DS1307_CTRL_ID);
@@ -196,7 +197,6 @@ void rtc_read(struct datetime *dt) { // Read realtime clock data, in 12-hour mod
   if (dt->month > 12) dt->month = 12; // careful: we use as subscript
   dt->year = bcd2bin(Wire.read());
 }
-
 void rtc_write(struct datetime *dt) { // Write realtime clock data
   Wire.beginTransmission(DS1307_CTRL_ID);
   Wire.write(0x00); // reset register pointer
@@ -209,7 +209,6 @@ void rtc_write(struct datetime *dt) { // Write realtime clock data
   Wire.write(bin2bcd(dt->year));
   Wire.endTransmission();
 }
-
 void show_time(byte row) {  // display formatted time
   char string[25];
   sprintf(string, "%2d %s 20%02d %2d:%02d %s",
@@ -217,7 +216,6 @@ void show_time(byte row) {  // display formatted time
   lcd.setCursor(0, row);
   lcd.print(string);
 }
-
 void show_current_time (byte row) {  // display current time
   if (REALTIME_CLOCK) rtc_read(&now);
   show_time(row);
@@ -259,25 +257,23 @@ static byte temp_to_resistance[HIGH_TEMP - LOW_TEMP + 1]
   68, 66, 64, 63, 61, 60, 59, 58, 56, 55, 54, 53, 51, 50, 49, 48, 47, 46, 45,
   44, 44, 43, 42, 41, 40, 39, 38, 37, 37, 36, 35, 35, 34, 34, 33, 32, 31, 29
 };
-
-void set_resistor(int zone, byte index) { // set one of the digital pots
+void set_resistor(int addr, byte index) { // set one of the digital pots
   byte chipselect;
-  chipselect = zone < 2 ? SPI_CS1 : SPI_CS2; // which chip has the right pair of pots
+  chipselect = addr < 2 ? SPI_CS1 : SPI_CS2; // which chip has the right pair of pots
   SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(chipselect, LOW);
-  SPI.transfer(zone & 1 ? 0x10 : 0x00);  // address one of the two wipers in that chip
+  SPI.transfer(addr & 1 ? 0x00 : 0x10);  // address one of the two wipers in that chip
   SPI.transfer(index); // follow with wiper index data
   digitalWrite(chipselect, HIGH);
   SPI.endTransaction();
 }
-
-void set_temp(int zone, int temp) { // set the temperature thermistor value for a zone
+void set_temp(int addr, int temp) { // set the temperature thermistor value for a zone
   if (temp < LOW_TEMP) temp = LOW_TEMP; // (We use 0 to indicate not a valid temp)
   if (temp > HIGH_TEMP) temp = HIGH_TEMP;
-  set_resistor(zone, temp_to_resistance[temp - LOW_TEMP]);
+  set_resistor(addr, temp_to_resistance[temp - LOW_TEMP]);
   if (DEBUG) {
     char string[40];
-    sprintf(string, "set zone %d to temp %dF, pot index %d", zone, temp, temp_to_resistance[temp - LOW_TEMP]);
+    sprintf(string, "set zone %d to temp %dF, pot index %d", addr+1, temp, temp_to_resistance[temp - LOW_TEMP]);
     Serial.println(string);
   }
 }
@@ -308,25 +304,25 @@ void get_packet(void) {  // receive and process a packet from the remote sensors
     }
     if (numbytes == sizeof(packet)   // got a full packet
         && packet.stx == STX && packet.etx == ETX  // with STX and ETX
-        && packet.zone < 4) {  // and a good zone number
+        && packet.addr < 4) {  // and a good addr number
       lrc = 0;
       for (unsigned i = 0; i < sizeof(packet) - 1; ++i) lrc ^= ((byte *)(&packet))[i];
       if (lrc != packet.lrc) {
-        ++zone[packet.zone].bad_packets;  // count a bad packet
+        ++zone[packet.addr].bad_packets;  // count a bad packet
       }
       else {  // record data from a good packet
-        ++zone[packet.zone].good_packets;  // count a good packet
-        zone[packet.zone].msec_since_packet = 0;
-        if (zone[packet.zone].lost_comm   // if we are recovering from lost communications
-            || zone[packet.zone].temperature != packet.temperature  // or the temp changed
-            || zone[packet.zone].battery != packet.battery) { // or the battery level changed
-          set_temp(packet.zone, packet.temperature);  // record the info
-          zone[packet.zone].temperature = packet.temperature;
-          zone[packet.zone].battery = packet.battery;
+        ++zone[packet.addr].good_packets;  // count a good packet
+        zone[packet.addr].msec_since_packet = 0;
+        if (zone[packet.addr].lost_comm   // if we are recovering from lost communications
+            || zone[packet.addr].temperature != packet.temperature  // or the temp changed
+            || zone[packet.addr].battery != packet.battery) { // or the battery level changed
+          set_temp(packet.addr, packet.temperature);  // record the info
+          zone[packet.addr].temperature = packet.temperature;
+          zone[packet.addr].battery = packet.battery;
           refresh_zoneinfo = true;
         }
-        zone[packet.zone].lost_comm = false;  // we're communicating
-        packet_log[packetlog_index].zone = packet.zone;  // make a packet log entry
+        zone[packet.addr].lost_comm = false;  // we're communicating
+        packet_log[packetlog_index].addr = packet.addr;  // make a packet log entry
         packet_log[packetlog_index].temperature = packet.temperature;
         packet_log[packetlog_index].battery = packet.battery;
         if (REALTIME_CLOCK) rtc_read(&now);
@@ -340,6 +336,38 @@ void get_packet(void) {  // receive and process a packet from the remote sensors
       if (DEBUG) Serial.println("bad size packet received");
     }
   }
+}
+
+//-----------------------------------------------------------------------------------------------------------------
+// Speaker beep
+//-----------------------------------------------------------------------------------------------------------------
+// This is a simplified version of Paul Stoffregen's "tone" library 
+// but it drives the piezo-electric speaker differentially for twice the volume.
+
+#define BEEP_FREQUENCY 4000 // Hz
+
+IntervalTimer beep_timer;
+unsigned long int interrupt_count;
+bool doing_beep = false;
+
+void beep_interrupt(void) {
+  if (doing_beep) { // doing a beep?
+    if (--interrupt_count) { // more to do: toggle both leads
+      digitalWriteFast(SPEAKER_POS, digitalReadFast(SPEAKER_POS) ^ 1);
+      digitalWriteFast(SPEAKER_NEG, digitalReadFast(SPEAKER_NEG) ^ 1);
+    } else {
+      beep_timer.end(); // stop the interrupts
+      doing_beep = false;
+    }
+  }
+}
+void speaker_beep (unsigned long int millisec) {
+  while (doing_beep) ; // wait for any previous beep to finish
+  interrupt_count = (millisec * BEEP_FREQUENCY / 1000) * 2;
+  digitalWriteFast(SPEAKER_POS, HIGH); // start with opposite polarity
+  digitalWriteFast(SPEAKER_NEG, LOW);
+  doing_beep = true;
+  assert(beep_timer.begin(beep_interrupt, 1000000 / BEEP_FREQUENCY / 2), "beep timer failed");
 }
 
 //-----------------------------------------------------------------------------------------------------------------
@@ -357,12 +385,13 @@ void setup() {
 
   lcd.begin(20, 4); // start LCD display
   lcd.noCursor();
-  lcd.setCursor(0, 0);
   sprintf(string, "initializing v%s", VERSION);
-  lcd.print(string);
+  center_message(0, string);
   delay(500);
 
   pinMode(LED, OUTPUT);   // configure miscellaneous I/O pins
+  pinMode(SPEAKER_POS, OUTPUT);
+  pinMode(SPEAKER_NEG, OUTPUT);
   pinMode(MODESW_1, INPUT_PULLUP);
   pinMode(MODESW_2, INPUT_PULLUP);
   pinMode(MODESW_3, INPUT_PULLUP);
@@ -371,7 +400,7 @@ void setup() {
   pinMode(BUTTON_2, INPUT_PULLUP);
 
   for (int i = 0; i < 3; ++i) {  // announce our presence
-    tone(SPEAKER, 4000, 100);
+    speaker_beep(100);
     digitalWrite(LED, HIGH);
     delay(100);
     digitalWrite(LED, LOW);
@@ -379,14 +408,18 @@ void setup() {
   }
 
 #if 0
-  for (int i = 3000; i < 5000; i += 100) { // test chirp frequencies
-    for (int j = 0; j < 5; ++j) {
-      tone(SPEAKER, i, 300);
-      lcd.setCursor(0, 0);
-      lcd.print(i);
-      delay(500);
+  while (1) {
+    for (int i = 3000; i < 5000; i += 100) { // test chirp frequencies
+      for (int j = 0; j < 5; ++j) {
+        tone(SPEAKER, i, 200);
+        lcd.setCursor(0, 0);
+        lcd.print(i);
+        delay(300);
+        if (digitalRead(BUTTON_2) == HIGH) goto stoptones;
+      }
     }
   }
+stoptones:
 #endif
 
   for (int i = 0; i < 4; ++i) { // initialize all four zones
@@ -418,8 +451,8 @@ void setup() {
   Serial1.begin(9600, SERIAL_8N1);
   digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
   send_command("AT");     // wake up the transceiver
-  //send_command("AT+DEFAULT");  // set everything to default: doesn't work with FU1 following!
   send_command("AT+FU1"); // set FU1 mode: medium speed, 3.6 ma
+  send_command("AT+C001"); // set channel 001: 433.4 Mhz
   if (DEBUG) {
     send_command("AT+V");  // get version number
     send_command("AT+RX"); // get all parameters
@@ -463,7 +496,7 @@ void setup() {
 #define DEBOUNCE_DELAY 50      // button debounce in msec
 
 void wait_for_button_release (byte pin) {
-  tone(SPEAKER, 4000, 100);
+  speaker_beep(100);
   delay (DEBOUNCE_DELAY);
   while (digitalRead(pin) == 1) ; // wait for release
   delay (DEBOUNCE_DELAY);
@@ -520,7 +553,6 @@ void set_timedate(void) {   // change the date and time
   show_time(3);
   delay(2000);
 }
-
 void show_packet_log(void) { // display the event log in reverse chronological order
   int index, count;
   char string[25];
@@ -528,16 +560,16 @@ void show_packet_log(void) { // display the event log in reverse chronological o
   index = packetlog_index; // points at oldest event, prior is newest
   for (count = packetlog_count; count > 0; --count) {
     if (--index < 0) index = PACKETLOG_SIZE - 1;
-    sprintf(string, "%u %2u %02u:%02u:%02u%s %uF",
-            packet_log[index].zone,
+    sprintf(string, "z%u %02u/%02u %02u:%02u:%02u %02u",
+            packet_log[index].addr+1,
+            packet_log[index].timestamp.month,
             packet_log[index].timestamp.date,
-            packet_log[index].timestamp.hour,
+            packet_log[index].timestamp.hour + (packet_log[index].timestamp.ampm ? 12 : 0),
             packet_log[index].timestamp.min,
             packet_log[index].timestamp.sec,
-            packet_log[index].timestamp.ampm ? "PM" : "AM",
             packet_log[index].temperature);
-    center_message(3, string);
     if (DEBUG) Serial.println(string);
+    center_message(3, string);
     for (int wait = 0; wait < 30; ++wait) { // number of tenths of a second
       delay(100);
       if (digitalRead(BUTTON_1) == 1) { // abort if button pushed
@@ -549,7 +581,6 @@ void show_packet_log(void) { // display the event log in reverse chronological o
     delay(100);
   }
 }
-
 void show_error_log(void) { // display the error log in reverse chronological order
   int index, count;
   char string[25];
@@ -562,15 +593,15 @@ void show_error_log(void) { // display the error log in reverse chronological or
   index = errorlog_index; // points at oldest error, prior is newest
   for (count = errorlog_count; count > 0; --count) {
     if (--index < 0) index = ERRORLOG_SIZE - 1;
-    sprintf(string, "%u %2u %02u:%02u:%02u%s",
-            error_log[index].zone,
+    sprintf(string, "z%u %02u/%02u %02u:%02u:%02u",
+            error_log[index].addr+1,
+            error_log[index].timestamp.month,
             error_log[index].timestamp.date,
-            error_log[index].timestamp.hour,
+            error_log[index].timestamp.hour + (error_log[index].timestamp.ampm ? 12 : 0),
             error_log[index].timestamp.min,
-            error_log[index].timestamp.sec,
-            error_log[index].timestamp.ampm ? "PM" : "AM");
-    center_message(3, string);
+            error_log[index].timestamp.sec);
     if (DEBUG) Serial.println(string);
+    center_message(3, string);
     for (int wait = 0; wait < 30; ++wait) { // number of tenths of a second
       delay(100);
       if (digitalRead(BUTTON_1) == 1) { // abort if button pushed
@@ -592,15 +623,14 @@ void show_last_packet_times(void) { // show the time we last received a packet f
     fsecs = tm % 1000;  tm /= 1000;
     secs = tm % 60; tm /= 60;
     mins = tm % 60; hrs = tm / 60;
-    sprintf(string, "Z%d: %uh %um %u.%03us", i, hrs, mins, secs, fsecs);
+    sprintf(string, "Z%d: %uh %um %u.%03us", i+1, hrs, mins, secs, fsecs);
     center_message(3, string);
     if (DEBUG) Serial.println(string);
     delay(3000);
   }
 }
-
 void process_commands(void) {  // allow the user to select which command mode to enter
-  tone(SPEAKER, 4000, 100);
+  speaker_beep(100);
   refresh_zoneinfo = true;  // setup to redraw rows 1 and 2
   center_message(2, "Select a command:");
 
@@ -649,20 +679,22 @@ void loop() {
   if (new_msec != last_msec) { // a millisecond has gone by: do our periodic stuff
     last_msec = new_msec;
 
-    for (int i = 0; i < 4; ++i) {  // count time in each zone since good packet data
+    for (int i = 0; i < 4; ++i) {  //**** count time in each zone since good packet data
       ++zone[i].msec_since_packet; // (bug: will overflow after 50 days of no packets)
       if (!zone[i].lost_comm && zone[i].msec_since_packet > 60 * 1000) { // if more than 60 seconds,
         zone[i].lost_comm = true; // declare communications is broken
         refresh_zoneinfo = true;
-        error_log[errorlog_index].zone = i;  // make an error log entry
+        error_log[errorlog_index].addr = i;  // make an error log entry
         if (REALTIME_CLOCK) rtc_read(&now);
         error_log[errorlog_index].timestamp = now;
         if (errorlog_count < ERRORLOG_SIZE) ++errorlog_count;
         if (++errorlog_index >= ERRORLOG_SIZE) errorlog_index = 0;
+        if (DEBUG) {
+          Serial.print("lost comm zone "); Serial.println(i);
+        }
       }
     }
-
-    if (refresh_zoneinfo) { // optionally redraw zone info on rows 1 and 2
+    if (refresh_zoneinfo) { //**** optionally redraw zone info on rows 1 and 2
       for (int i = 0; i < 4; ++i) {
         lcd.setCursor(5 * i, 1);
         sprintf(string, zone[i].temperature == 0 ? "     "  // have never heard from this zone
@@ -676,17 +708,15 @@ void loop() {
       }
       refresh_zoneinfo = false;
     }
-
-    if (--chirp_delay == 0) {   // make a low-battery alarm sound
+    if (--chirp_delay == 0) {   //**** make a low-battery alarm sound
       for (int i = 0; i < 4; ++i)
         if (zone[i].battery != 0 && zone[i].battery < BATTERY_THRESHOLD) { // at least one battery is low
-          tone(SPEAKER, 4000, 300); // chirp for 300 msec
+          speaker_beep(300); // chirp for 300 msec
           break;
         }
       chirp_delay = 3 * 1000; //  seconds between chirps
     }
-
-    if (--blink_delay == 0) { // blink the low-battery display
+    if (--blink_delay == 0) { //**** blink the low-battery display
       for (int i = 0; i < 4; ++i) {
         if (zone[i].battery != 0 && zone[i].battery < BATTERY_THRESHOLD) { // flash any "LoBAT"s
           lcd.setCursor(5 * i, 2);
@@ -696,8 +726,7 @@ void loop() {
       blink_on = !blink_on;
       blink_delay = 500;  // half second between blink changes
     }
-
-    if (--info_delay == 0) {   // show miscellaneous stuff on the last line
+    if (--info_delay == 0) {   //**** show miscellaneous stuff on the last line
       bool any_bad_packets = false;
       for (int i = 0; i < 4; ++i) if (zone[i].bad_packets) any_bad_packets = true;
       for (int i = 0; i < 4; ++i) { // for each zone
