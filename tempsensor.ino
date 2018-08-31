@@ -1,466 +1,687 @@
-/*************************************************************************************
+/***************************************************************************************************
 
-    Battery-powered remote wireless temperature sensor
+    Battery-powered remote wireless temperature sensor, version 2
 
-  This is the software for a small (3" x 3" x 1") battery-powered wireless sensor
-  that measures temperature (and humidity), displays it on a 2-digit LCD screen,
-  and periodically sends it to a receiver that digitally simulates the resistance
-  of a thermistor inside up to four Mitsubishi thermostats.
+   This is the software for a small (3" x 3" x 1") battery-powered wireless sensor
+   that measures temperature and humidity, displays the temperature, date, and time
+   on a 1" x 1" e-paper display, and periodically sends data to a receiver that
+   digitally simulates the resistance of thermistors inside up to four conventional
+   (Mitsubishi) wired thermostats.
 
-  The custom-built sensor hardware consist of:
-  - Teensy LC microcontroller from www.pjrc.com
-  - Seeed HC-12 433 Mhz RF transceiver from www.seeedstudio.com
-  - Varitronix VI-201 2-digit 7-segment LCD display
-  - TI HDC1008 I2C digital temperature/humidity sensor, from www.adafruit.com
-  - Linear LT1004 2.5V micropower voltage reference to measure the battery
-  - 4 slide switches to set the sensor address and mode
-  - 3-cell AAA battery holder
+   This is version 2, reimplemented with parts optimized for low power consumption,
+   because the batteries in the first version only lasted two to three months.
+   The objective is to the have 3 AAA batteries (1000 mAH) last a year or more.
+   That requires a time-averaged current draw of less than 0.11 mA (110 uA), and
+   we achieve about 80-90 uA.
 
-  Since we're battery-powered, we try hard to minimize power utilization
-  by using the various sleep/hiberate modes of the CPU and the RF transmitter.
-  It looks like we average about 100 uA, which means that standard 1000 mAh
-  alkaline AAA batteries should last about a year. We'll see.
+   The custom-built sensor hardware consist of:
+   - Atmel ATmega328P processor, with 32K of Flash ROM and 2K bytes of RAM
+     https://www.microchip.com/wwwproducts/en/ATmega328P
+     We use the internal 8Mhz RC oscillator and 8x prescaler, for a 1Mhz clock speed.
+   - HopeRF RFM95 LoRa 868/915 Mhz spread-spectrum radio
+     http://www.hoperf.com/rf_transceiver/lora/RFM95W.html
+   - Waveshare 1" x 1" 200x200 pixel e-Paper display
+     https://www.waveshare.com/wiki/1.54inch_e-Paper_Module
+     (The old version only! See below.)
+   - Silicon Labs Si7021 I2C digital temperature/humidity sensor
+     https://www.silabs.com/documents/public/data-sheets/Si7021-A20.pdf
+     https://www.sparkfun.com/products/13763
+   - Microchip MCP1711 150 mA ultra-low quiescent current LDO 3.3V regulator
+     http://ww1.microchip.com/downloads/en/DeviceDoc/20005415D.pdf
+   - 3-cell AAA battery holder
+     https://www.digikey.com/product-detail/en/2479/36-2479-ND/303824
+   - 2-position slide switche to set the sensor address and mode
+     https://www.digikey.com/product-detail/en/1825360-3/450-1781-ND/3283586
+   - 3" x 3" x 1.2" vented plastic enclosure
+     https://www.ebay.com/itm/Z-123-WH-Enclosure-multipurpose-X75-8mm-Y78-8mm-Z30-2mm-vented-ABS-Z123BABS/401475260109
 
-  The design of the hardware and software for the sensors and the corresponding
-  receiver is open-source.  See https://github.com/LenShustek/tempsensor.
+   The design of the hardware and software for the sensors and the corresponding
+   receiver is open-source.  See https://github.com/LenShustek/tempsensor.
 
-  --------------------------------------------------------------------------
-    (C) Copyright 2015, Len Shustek
+   Our measured current draw for various phases is as follows:
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of version 3 of the GNU General Public License as
-    published by the Free Software Foundation at http://www.gnu.org/licenses,
-    with Additional Permissions under term 7(b) that the original copyright
-    notice and author attibution must be preserved and under term 7(c) that
-    modified versions be marked as different from the original.
+    sleeping:            13 uA
+    get temp/humidity:  4.7 mA for 12 msec
+    read battery:       4.5 mA for 0.9 msec
+    send packet, 15 dBm: 90 mA for 42 msec
+    receive packet:      12 mA for 45 msec
+    write date:         4.7 mA for 36 msec (once a day)
+    write time:         4.7 mA for 36 msec (once a minute)
+    write temp:         4.7 mA for 87 msec (only when it changes)
+    update display:     8.2 mA for 360 msec (when any of the above happened)
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-  --------------------------------------------------------------------------
-  Change log
+   The long-term average is about 88 uA if we send a packet about
+   every 2 minutes and change the time display every minute.
+   So the batteries should last almost 18 months!
 
-  11 Nov 2015, V1.0, L. Shustek, First version.
-  30 Nov 2015, V1.1, L. Shustek, Add retry for HC-12 errors.
-  19 Dec 2015, V1.2, L. Shustek, Use zone 1..4 in displays.
-                                 Read addr switches before going into sleep mode.
+   Note that the quiescent current of 13 uA is not just the processor, which
+   is about 7 uA with the watchdog timer running. It also includes the sleep
+   currents of the e-paper display, RF radio, temperature/humidity sensor,
+   battery test voltage divider, and voltage regulator.
 
-*************************************************************************************/
+   WARNING: The latest version of the Waveshare 1" x 1" display module includes
+   a voltage regulator and level shifter so that it works on 5V systems. But
+   that makes it useless for this application, since the quiescent current goes
+   from less than 5 uA to more than 150 uA! I was able to get them to send me
+   enough of the old version, but it is now out of stock. If you have high-level
+   soldering skills, you can use a hot-air rework gun to remove the regulator and
+   level-shifter from the new version, and then solder 7 tiny wires to bridge
+   the signals. That works, but it's hard to do. It also has a different connector
+   (2mm spacing instead of 2.5mm spacing) compared to the old version.
+   An alternative would be to buy just the raw e-paper display and add the 19
+   passive components described in the datasheet.
 
-#define DEBUG 0     // monitor window debugging
-#define TESTS 0     // miscellaneous tests
+   Tips for programming the "bare" ATMega328P:
+      - A 2x3 pin header mates to the Adafruit USBTinyISP programmer,
+        with the "power board" jumper removed.
+      - Select the "USBTiny" programmer in the Aduino IDE tools/programmer menu.
+         Then "Upload using programmer". May have to retry and/or power cycle
+         the board and/or the USBTinyISP; it's finicky.
+      - Also can use AVRDUDE to check and modify fuse settings to change the
+        clock or to make the clock appear on the CLKO pin.
+      - The board selection is "Arduino/Genuino Uno", but the boards.txt file
+        has to be changed to allow the frequency to be set to 1 MHz, which is
+        the default with the internal 8Mhz oscillator and 8x precaling.
+          #uno.build.f_cpu=1000000L
+          ...
+          menu.speed=CPU Speed
+          uno.menu.speed.1=1 MHz
+          uno.menu.speed.2=2 MHz
+          uno.menu.speed.4=4 MHz
+          uno.menu.speed.8=8 MHz
+          uno.menu.speed.16=16 MHz
+          uno.menu.speed.1.build.f_cpu=1000000L
+          uno.menu.speed.2.build.f_cpu=2000000L
+          uno.menu.speed.4.build.f_cpu=4000000L
+          uno.menu.speed.8.build.f_cpu=8000000L
+          uno.menu.speed.16.build.f_cpu=16000000L
+       (See https://tttapa.github.io/Pages/Arduino/Bootloaders/ATmega328P-custom-frequency.html)
 
-#define TRANSMIT 1    // allow transmitting
-#define DEEP_SLEEP 1  // allow "deep sleep" for normal waits
-#define HIBERNATE 1   // allow "hibernation" for catatonic waits when the transmitter is idle
+   The ATMega328p comes with fuses preprogrammed for the internal RC 8 Mhz
+   ocillator divided by 8, for a system clock of 1 Mhz. We leave it at that.
 
-#include <arduino.h>
-#include <Snooze.h>
-#include <Wire.h>
+   To output the clock to CLKO (pin 14 on the DIP, pin 12 on the TQFP) to
+   see with a scope how far off the clock really is from 8 Mhz, change the
+   lower fuse byte from the default of 0x62 to 0x22 as follows:
+     avrdude -c usbtiny -p m328p -U lfuse:w:0x22:m
+   You can then tweak OSCCAL (as we do in init()) to get closer to 8 Mhz.
+   Not that it matters much...
 
-SnoozeBlock sleep_config;
+   It's harder to figure out what the real frequency of the watchdog timer
+   oscillator is, but we did that by looking at how good our timekeeping is
+   when we're not getting response packets from the receiver. It's not that
+   critical though; it only affects the accuracy of the time we display
+   when out of communication with the central receiver station.
 
-// the packet we send
+   Tips for debugging:
+     A 6-pin header mates to the Taylor Roco CP2102 USB-to-TTL converter.
+     Connect that to a Windows PC and run the Termite terminal emulator.
+     Then all the Serial.print output will appear.
 
-struct {
-  byte stx;         // STX=0x02
-  byte addr;        // our address, 0..3 (displayed and set as 1..4)
-  byte type;        // this message type: 1
-  byte temperature; // temperature in degrees F, 0 to 120
-  byte humidity;    // humidity in percent, 0..100
-  byte battery;     // battery voltage*10
-  byte etx;         // ETX=0x03
-  byte lrc;         // XOR of stx through etx
-} packet;
-#define STX 0x02
-#define ETX 0x03
-unsigned long count_sent_packets = 0;
+   By the way: AVR 8-bit processors like the ATMega328P have no divide
+   instruction, so minimize division in places where time matters!
 
-// battery voltage test stuff
+   ------------------------------------------------------------------------------
+   Copyright (C) 2015,2018, Len Shustek
 
-#define BATTERY_PIN A12  // the pin where battery voltage/2 appears
-#define AREF_MV 2500     // the analog reference voltage in millivolts
+   The MIT License (MIT): Permission is hereby granted, free of charge, to any
+   person obtaining a copy of this software and associated documentation files
+   (the "Software"), to deal in the Software without restriction, including
+   without limitation the rights to use, copy, modify, merge, publish, distribute,
+   sublicense, and/or sell copies of the Software, and to permit persons to whom
+   the Software is furnished to do so, subject to the following conditions:
+   The above copyright notice and this permission notice shall be
+   included in all copies or substantial portions of the Software.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+   FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+   COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+   IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+   ------------------------------------------------------------------------------
+   Change log
 
-// LCD 2-digit 7-segment display: Varitronix VI-201
+   11 Nov 2015, V1.0, L. Shustek, First version.
+   30 Nov 2015, V1.1, L. Shustek, Add retry for HC-12 errors.
+   19 Dec 2015, V1.2, L. Shustek, Use zone 1..4 in displays.
+                                  Read addr switches before going into sleep mode.
+   05 Jul 2018, V2.0, L. Shustek, Reimplemented with completely different hardware for lower power.
 
-#define LCD_DIGIT1_SEGMENTS GPIOC_PDOR  // all of register D are digit 1 segments
-#define LCD_DIGIT2_SEGMENTS GPIOD_PDOR  // all of register C are digit 2 segments
-#define LCD_DIGIT_COM  3                // common for both digits
-byte lcd_pins[] = {
-  2, 14, 7, 8, 6, 20, 21, 5,
-  15, 22, 23, 9, 10, 13, 11, 12,
-  LCD_DIGIT_COM
-}; // note that pin 13 (PTC5) is attached to a LED on the Teensy board that should be removed to save power
+*****************************************************************************************************/
+#define VERSION 20
 
-byte digit_segments[11] = { // bit map of segments to light up, with top segment A as the LSB, for 0-9 and 'E'
-  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x79
-};
-#define POINT1 1
-#define POINT2 2
-#define NOPOINTS 0
+#define TIME_BETWEEN_SENDS 2*60*1000UL // Nominally 2 minutes. Should it depend on whether temp changed?
+//#define TIME_BETWEEN_SENDS 5*1000UL  // every 5 seconds, for antenna testing
 
-// address and mode slide switches
+#define DEBUG 0         // output monitor window debugging?
+#define MARKTIMING 0    // generate logic analyzer timing pulse output?
 
-#define SW1 16  //leftmost;  we read "on" as a zero
-#define SW2 17  // (weird: pin 17 is always zero after we've used deep sleep mode!) 
-#define SW3 24
-#define SW4 25  //rightmost
+#define RADIO  1        // switches to disable code for power consumption and other testing
+#define EPAPER 1
+#define TEMPSENSOR 1
 
-// temperature/humidity sensor: Adafruit's breakout board for the TI HDC1008
+#define AREF_MV 3300    // analog reference voltage is VDD = 3.3V
 
-#define HDC1000_I2CADDR       0x40
-#define HDC1000_TEMP          0x00
-#define HDC1000_HUMID         0x01
-#define HDC1000_CONFIG        0x02
-#define HDC1000_CONFIG_RST    (1 << 15)
-#define HDC1000_CONFIG_HEAT   (1 << 13)
-#define HDC1000_CONFIG_MODE   (1 << 12)
-#define HDC1000_CONFIG_BATT   (1 << 11)
-#define HDC1000_CONFIG_TRES_14  0
-#define HDC1000_CONFIG_TRES_11  (1 << 10)
-#define HDC1000_CONFIG_HRES_14  0
-#define HDC1000_CONFIG_HRES_11  (1 << 8)
-#define HDC1000_CONFIG_HRES_8   (1 << 9)
+#include <Arduino.h>
+#include <Wire.h>       // I2C for Si7021 temperature/humidity sensor
+#include <SPI.h>        // SPI for ePaper display, and the RF Radio
+#include <RFradio.h>    // our RFM95 LoRa radio library
+#include "display.h"    // e-paper display
 
-#define HDC1000_SERIAL1       0xFB
-#define HDC1000_SERIAL2       0xFC
-#define HDC1000_SERIAL3       0xFD
-#define HDC1000_MANUFID       0xFE
-#define HDC1000_DEVICEID      0xFF
+// pin assignments
 
-uint16_t current_temp;    // degrees F
-uint16_t current_humid;   // percent, 0..100
+// The #define numbers are the Arduino "fake" pin numbers
+#define RF_CS_PIN A2    // RF radio chip select, PC2, PDIP pin 25, TQFP pin 25
+#define RF_RESET_PIN A3 // RF radio reset, PC2, PDIP pin 26, TQFP pin 26
+#define BATTERY_PIN A0  // battery voltage/2, PC0, PDIP pin 23, TQFP pin 23
+#define SW1 6           // node address MSB, PD6, PDIP pin 12, TQFP pin 10
+#define SW2 7           // node address LSB, PD7, PDIP pin 13, TQFP pin 11
+#define LED 0           // LED, active low, PD0, PDIP pin 2, TQFP pin 30
+// The pin assignments for the e-paper display are in display.h!
 
-//-----------------------------------------------------------------------------------------------------------------
-// processor sleep modes, using the "Snooze" library at https://github.com/duff2013/Snooze
-//-----------------------------------------------------------------------------------------------------------------
+#define TIME_MARKER_PIN 9   // PB1, PDIP pin 15, TQFP pin 13
+#define TIME_MARKER_PORT 0x05  // r/w data port B, 0-based address for SBI/CBI instructions
+#define TIME_MARKER_BIT 1      // bit number (not mask)
 
-#if DEEP_SLEEP && !DEBUG  // use this while RF transmitter is alive
-void sleep_delay(int milliseconds) { // delay in deep sleep; power consumption is about 230 uA
-  sleep_config.setTimer(milliseconds);
-  Snooze.deepSleep(sleep_config);
-}
-#else
-#define sleep_delay delay   // (going into sleep mode kills the USB connection to the debugging monitor window)
-#endif
+// implicit pins used are:
+//    MOSI: arduino pin 11, PB3, PDIP pin 17, TQFP pin 15
+//    MISO: arduino pin 12, PB4, PDIP pin 18, TQFP pin 16
+//    SCK:  arduino pin 13, PB5, PDIP pin 19, TQFP pin 17
 
-#if HIBERNATE && !DEBUG  // ok to use when the RF transmitter is sleeping
-void hibernate_delay(int milliseconds) { // delay in hibernation; power consumption is about 10 uA
-  sleep_config.setTimer(milliseconds);
-  Snooze.hibernate(sleep_config);
-}
-#else
-#define hibernate_delay sleep_delay
-#endif
+byte node_addr;            // 0..3
+byte current_temp = 0;     // degrees F
+byte current_humid = 0;    // percent, 0..100
+struct pkt_temp_t xmt_pkt; // the packet we send: temp, humidity, battery voltage
+struct pkt_resp_t rcv_pkt; // the packet we receive: date, time
+static bool display_working = false;
 
 //-----------------------------------------------------------------------------------------------------------------
 //  Temperature/humidity sensor routines
-//  The TI HDC1008 communicates using the I2C protocol (SCL/SDA)
+//  The Si7021 communicates using the I2C protocol (SCL/SDA)
 //-----------------------------------------------------------------------------------------------------------------
 
-void HDC1000_reset (void) { // reset, and select 14 bit temp & humidity
-  uint16_t config = HDC1000_CONFIG_RST | HDC1000_CONFIG_MODE | HDC1000_CONFIG_TRES_14 | HDC1000_CONFIG_HRES_14;
-  Wire.beginTransmission(HDC1000_I2CADDR);
-  Wire.write(HDC1000_CONFIG); // was missing from Adafruit library???
-  Wire.write(config >> 8);
-  Wire.write(config & 0xFF);
-  Wire.endTransmission();
-  hibernate_delay(15);
+#define Si7021_I2CADDR       0x40   // I2C address
+#define Si7021_WRITEREG      0xe6   // write User Register 1
+#define Si7021_TEMP          0xf3   // measure temperature, no hold master mode
+#define Si7021_HUMID         0xf5   // measure humidity, no hold master mode
+#define Si7021_TEMP_PREV     0xe0   // return temp measured during humidity measurement
+
+void Si7021_writereg(byte val) {  // write User Register 1
+   Wire.beginTransmission(Si7021_I2CADDR);
+   Wire.write(Si7021_WRITEREG);
+   Wire.write(val);
+   Wire.endTransmission(); }
+
+void Si7021_init (void) { // initialize
+   Wire.beginTransmission(Si7021_I2CADDR);
+   Wire.write(0xfc);  // request 2nd access of serial number
+   Wire.write(0xc9);
+   Wire.endTransmission();
+   Wire.requestFrom(Si7021_I2CADDR, 1);
+   byte ID = Wire.read();  // SNB3 field should be 0x15 for Si7021
+   if (ID != 0x15) {
+      Serial.println("No temp sensor");
+      fatal("No temp sensor", FATAL_NO_TEMPSENSOR); }
+   Si7021_writereg(0x01);  // select 8 bit humidity, 12 bit temp
 }
-uint16_t HDC1000_read16(uint8_t a) {
-  Wire.beginTransmission(HDC1000_I2CADDR);
-  Wire.write(a);
-  Wire.endTransmission();
-  hibernate_delay(2);
-  Wire.requestFrom(HDC1000_I2CADDR, (uint8_t)2);
-  return (Wire.read() << 8) | Wire.read();
-}
-boolean HDC1000_begin(void) {
-  Wire.begin();
-  HDC1000_reset();
-  if (HDC1000_read16(HDC1000_MANUFID) != 0x5449) return false;
-  if (HDC1000_read16(HDC1000_DEVICEID) != 0x1000) return false;
-  return true;
-}
-void HDC1000_gettemphum(void) {
-  Wire.beginTransmission(HDC1000_I2CADDR);
-  Wire.write(HDC1000_TEMP);
-  Wire.endTransmission();
-  hibernate_delay(20);
-  Wire.requestFrom(HDC1000_I2CADDR, (uint8_t)4);
-  current_temp = Wire.read();
-  current_temp <<= 8;
-  current_temp |= Wire.read();
-  current_humid = Wire.read();
-  current_humid <<= 8;
-  current_humid |= Wire.read();
-  if (0) {
-    Serial.print("raw temp, humid: ");
-    Serial.print(current_temp); Serial.print(", ");
-    Serial.print(current_humid); Serial.println();
-  }
-  // convert raw T to degrees F: ((T/2^16)*165-40)*9/5+32
-  current_temp = (((((uint32_t)current_temp * 1485) >> 16) - 360) / 5) + 32;
-  // convert raw H to relative humidity in %
-  current_humid = ((uint32_t)current_humid * 100) >> 16;
-  if (DEBUG) {
-    Serial.print("temp, humid: ");
-    Serial.print(current_temp); Serial.print(", ");
-    Serial.print(current_humid); Serial.println();
-  }
-}
+
+uint16_t Si7021_measure(byte cmd, byte delay_msec) {
+   Wire.beginTransmission(Si7021_I2CADDR);
+   Wire.write(cmd);
+   Wire.endTransmission();
+   delay(delay_msec);
+   Wire.requestFrom(Si7021_I2CADDR, 2);
+   byte msb = Wire.read();
+   byte lsb = Wire.read() & 0xfc;
+   return msb << 8 | lsb; }
+
+void Si7021_gettemphum(void) {
+   uint16_t raw_humid = Si7021_measure(Si7021_HUMID, 7);   // 8 bit humid takes 3.1 msec max, plus 3.8 for temp
+   uint16_t raw_temp = Si7021_measure(Si7021_TEMP_PREV, 1); // 12 bit temp as measured already
+   if (0 && DEBUG) {
+      Serial.print("raw temp, humid: ");
+      Serial.print(raw_temp); Serial.print(", ");
+      Serial.print(raw_humid); Serial.println(); }
+   // convert raw T to degrees F: ((175.72*raw/2^16)-46.85) * 1.8 + 32
+   // or F = (316.296*raw - 52.33*2^16) / 2^16
+   // To calculate with 32-bit integers, we scale up by a factor of 2^6 = 64
+   // F = (20242*raw - 219487928 + 2^21 /*rounding*/) / 2^22
+   // F = (20242*raw - 217390776) >> 22
+   current_temp = (byte)(((uint32_t)raw_temp * 20242UL - 217390776UL) >> 22);
+   // convert raw H to relative humidity in %: RH = (125*raw/2^16) - 6;
+   if (raw_humid < 3146) raw_humid = 3146;  // prevent <0 or >100
+   if (raw_humid > 55575) raw_humid = 55575;
+   current_humid = (byte) ((((uint32_t)raw_humid * 125) >> 16) - 6);
+   if (DEBUG) {
+      Serial.print("converted temp, humid: ");
+      Serial.print(current_temp); Serial.print(", ");
+      Serial.print(current_humid); Serial.println(); } }
+
 //-----------------------------------------------------------------------------------------------------------------
-//    LCD display routines
-//
-//    The segments, including the decimal points, are wired to Teensy ports C and D so we can bulk-write them.
-//    The common cathodes for both digits are wired together to a single I/O port.
-//    The displays are not multiplexed, and need to be driven by AC to avoid image degradation and reduced life.
+//    sleep routines
 //-----------------------------------------------------------------------------------------------------------------
 
-void shownum (byte num, byte points, int time) { // display 2-digit number, or "En" for value 100+n
-#define DISPLAY_DELAY 25  // 25*2 msec is 20 Hz, which flickers a little when viewed from the side
-  // but slower is better to minimize power utilization
-  int cycles = time / (2 * DISPLAY_DELAY);
-  byte d1segments = digit_segments[(num / 10) % 11] | (points & POINT1 ? 0x80 : 0);
-  byte d2segments = digit_segments[num % 10] | (points & POINT2 ? 0x80 : 0);
-  do {
-    digitalWriteFast(LCD_DIGIT_COM, LOW); // first cycle: COM is low
-    LCD_DIGIT1_SEGMENTS = d1segments; // and lit segments are high
-    LCD_DIGIT2_SEGMENTS = d2segments;
-    hibernate_delay(DISPLAY_DELAY);
-    digitalWriteFast(LCD_DIGIT_COM, HIGH); // second cycle: COM is high
-    LCD_DIGIT1_SEGMENTS = ~d1segments; // and lit segments are low
-    LCD_DIGIT2_SEGMENTS = ~d2segments;
-    hibernate_delay(DISPLAY_DELAY);
-  } while (--cycles);
-  digitalWriteFast(LCD_DIGIT_COM, LOW);
-  LCD_DIGIT1_SEGMENTS = 0;
-  LCD_DIGIT2_SEGMENTS = 0;
+ISR (WDT_vect) { // watchdog timer interrupt
+   __asm__ __volatile__ ("wdr");  // reset the watchdog timer
+   MCUSR &= ~bit(WDRF); // reset WD system reset flag
+   // Keep old prescaler setting to prevent unintentional time-out
+   WDTCSR |= (1 << WDCE) | (1 << WDE); // enable changes
+   WDTCSR = 0x00; // Turn off WDT
 }
-void fatal_error (int errnum) {   // become catatonic with flashing error number "En"
-  // 1: can't start RF transmitter
-  // 2: can't wake RF transmitter
-  // 3: can't start temperature sensor
-  // 4: bad address in switches
-  while (1) {
-    shownum(100 + errnum, NOPOINTS, 500);
-    hibernate_delay(500);
-  }
+void sleep (byte sleep_code) {  // some of this is from http://gammon.com.au/power
+   noInterrupts (); {
+      MCUSR = 0; // clear various "reset" flags
+      WDTCSR = bit (WDCE) | bit (WDE);   // allow changes to watchdog register, disable reset
+      WDTCSR = bit (WDIE) | sleep_code;  // set interrupt mode, and the delay
+      __asm__ __volatile__ ("wdr");      // reset and start the watchdog timer
+      SMCR = 0x05; // set POWER_DOWN_SLEEP_MODE and SLEEP_ENABLE_MASK
+      MCUCR = bit (BODS) | bit (BODSE);  // turn off brown-out detect during sleep
+      MCUCR = bit (BODS); }
+   interrupts ();   // guarantees the next instruction is executed
+   __asm__ __volatile__ ( "sleep" );   // enter sleep mode
+   SMCR = 0;  // disable sleep mode
 }
+#define turnon_SPI(x) PRR &= ~bit(PRSPI)
+#define turnoff_SPI(x) PRR |= bit(PRSPI)
+
+#define turnon_TWI(x) PRR &= ~bit(PRTWI)
+#define turnoff_TWI(x) PRR |= bit(PRTWI)
+
+#define turnon_ADC(x) {PRR &= ~bit(PRADC); ACSR &= ~bit(ACD); ADCSRA |= bit(ADEN);}
+#define turnoff_ADC(x) {ADCSRA &= ~bit(ADEN); ACSR |= bit(ACD); PRR |= bit(PRADC);}
+
 //-----------------------------------------------------------------------------------------------------------------
-// HC-12 433 Mhz wireless serial port transceiver routines
-//
-// This is connected to the second serial UART port, Serial1 on pins 0 and 2.
-// The "set" line controls whether we're sending commands or data.
+//    display and utility routines
 //-----------------------------------------------------------------------------------------------------------------
 
-#define HC12_SET 4    // port number for "set" input of transceiver
+void writedate(struct datetime_t *p) {
+   static const char *days[] =
+   {"???", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+   static const char *months[] =
+   {"???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+   char msg[20];
+   if (p->wday > 7) p->wday = 0;
+   if (p->month > 12) p->month = 0;
+   sprintf_P(msg, PSTR("%s %s %d "), days[p->wday], months[p->month], p->date);
+   dsp_writestr(&font24, 24, 125, msg); }
 
-void send_command(const char *cmd) {
-  Serial1.println(cmd);
-  if (DEBUG) {
-    Serial.print("cmd: ");
-    Serial.println(cmd);
-  }
-  Serial1.flush();  // wait for all bytes to be sent
-}
-bool get_response(const char *expected_rsp) {
-  char response[50];
-  byte response_length;
-  Serial1.setTimeout(100); // give it up to these many msec to process
-  response_length = Serial1.readBytes(response, sizeof(response) - 1);
-  response[response_length] = '\0';
-  if (DEBUG) {
-    Serial.print("rsp: ");
-    if (response_length == 0) Serial.print("<none>");
-    else for (int i = 0; response[i] > 0x0d; ++i) Serial.print(response[i]);
-    Serial.println();
-  }
-  if (expected_rsp) {
-    if (strcmp(response, expected_rsp) != 0) { // didn't get expected response
-      if (DEBUG) Serial.println("Didn't get expected response");
-      return false;
-    }
-    if (DEBUG) Serial.println("Got expected response");
-  }
-  return true;
-}
+void writetime(struct datetime_t *p) {
+   char msg[20];
+   char ampm = 'a';
+   byte hour = p->hour;
+   if (hour > 11) {
+      hour -= 12; ampm = 'p'; }
+   if (hour == 0) hour = 12;
+   sprintf_P(msg, PSTR("%2d:%02d %cm"), hour, p->min, ampm);
+   dsp_writestr(&font24, 32, 150, msg); }
+
+void fatal(char const * msg, const byte num) {
+   if (DEBUG) {
+      Serial.print("ERROR: ");
+      Serial.println(msg); }
+   if (display_working) {
+      turnon_SPI();
+      dsp_start(true); // full update mode
+      dsp_writestr(&font24, 0, 125, (char *)"FATAL ERROR:");
+      char buf[40];
+      strcpy(buf, msg); // copy from FLASH
+      buf[12] = 0;  // max 12 chars
+      dsp_writestr(&font24, 0, 150, buf);
+      dsp_displaymem(true);
+      dsp_sleep(); // put the display into deep sleep
+      turnoff_SPI(); }
+   while (1) { // flash light as the last resort
+      for (byte cnt = 0; cnt < 10; ++cnt) { // flutter to indicate "fatal error"
+         digitalWrite(LED, LOW);
+         delay(25);
+         digitalWrite(LED, HIGH);
+         delay(25); }
+      delay(500);
+      for (byte cnt = 0; cnt < num; ++cnt) { // count out the error number
+         digitalWrite(LED, LOW);
+         delay(200);
+         digitalWrite(LED, HIGH);
+         delay(400); }
+      delay(500); } }
+
+#if MARKTIMING
+void MARKTIME(byte cnt) { // coded pin output to use the logic analyzer for timing
+   do {
+      __asm__ ("sbi %0,%1\n"::"I"(TIME_MARKER_PORT), "I"(TIME_MARKER_BIT));
+      __asm__ ("nop\n");
+      __asm__ ("cbi %0,%1\n"::"I"(TIME_MARKER_PORT), "I"(TIME_MARKER_BIT)); }
+   while (--cnt); }
+#else
+#define MARKTIME(x)
+#endif
 
 //-----------------------------------------------------------------------------------------------------------------
 //    Initialization
 //-----------------------------------------------------------------------------------------------------------------
 
+uint32_t time_between_sends = 0;  // the constant above, plus some fuzz based on our address
+uint32_t last_send_time = 0;      // the millis() when we last sent a packet
+byte displayed_min = 0xff;
+
+struct datetime_t datetime_now = {        // the date/time now
+   0, 0, 0, 1, 29, 7, 48 };               // (starting default is midnight July 29, 2018)
+uint32_t datetime_now_millis = 0;         // the milliseconds now
+uint32_t datetime_now_update_time = 0;    // when we last updated "now"
+
 void setup() {
-  int tries;
-  byte address_switches;
+   if (DEBUG) {
+      Serial.begin(9600);
+      delay(1000);
+      Serial.println("Sensor started.\n"); }
+   else delay(1000);
 
-  if (DEBUG) {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("Sensor started.\n");
-  }
-  else delay(1000);
+   pinMode(SW1, INPUT_PULLUP); // configure and read node address switches
+   pinMode(SW2, INPUT_PULLUP);
+   node_addr = ( (digitalRead(SW1) << 1) | digitalRead(SW2)) ^ 0x03; // 0..3
+   // After reading, set the switch inputs to output 0 instead.
+   // Otherwise the 30 Kohm internal pullup uses 100 uA for each closed switch!
+   digitalWrite(SW1, 0);
+   digitalWrite(SW2, 0);
+   pinMode(SW1, OUTPUT);
+   pinMode(SW2, OUTPUT);
 
-  analogReference(EXTERNAL);  // for battery voltage check, use external reference voltage
-  pinMode(SW1, INPUT_PULLUP); // configure addr/mode switches
-  pinMode(SW2, INPUT_PULLUP);
-  pinMode(SW3, INPUT_PULLUP);
-  pinMode(SW4, INPUT_PULLUP);
+   digitalWrite(LED, HIGH);  // indicator light is active low
+   pinMode(LED, OUTPUT);
+   digitalWrite(TIME_MARKER_PIN, LOW); // logic analyzer time marker
+   pinMode(TIME_MARKER_PIN, OUTPUT);
 
-  // Switch 2 (pin 17/A3) will always read as zero after going into sleep mode because the
-  // Snooze library reconfigures it to output a zero to avoid turning on the 74V1T125 buffer.
-  // So we read the (active low) address/mode switches here, before ever using deep sleep.
-
-  address_switches = ( (digitalRead(SW3) << 1) | digitalRead(SW4)) ^ 0x03; // 0..3
-
-  LCD_DIGIT1_SEGMENTS = 0; // initialize 2-digit display
-  LCD_DIGIT2_SEGMENTS = 0;
-  for (int i = 0; i < sizeof(lcd_pins); ++i)
-    pinMode(lcd_pins[i], OUTPUT);
-  shownum(88, POINT1 + POINT2, 1000); // show all segments for a second
-  delay(500);
-  if (TESTS) {
-    for (int i = 0; i < 9; ++i) {// display all possible digits
-      shownum(i * 10 + i + 1, NOPOINTS, 300);
-    }
-  }
-
-#if HIBERNATE && !DEBUG  // turn off peripherals we don't use
-  // This doesn't actually help very much, if at all...
-  sleep_config.setPeripheral = CMP_OFF;
-  sleep_config.setPeripheral = I2C0_OFF;
-  sleep_config.setPeripheral = UART2_OFF;
-  sleep_config.setPeripheral = UART3_OFF;
-#endif
-
-  if (!HDC1000_begin()) // start current_temperature/humidity sensor
-    fatal_error(3); // E3 error
-
-  if (TRANSMIT) {
-    pinMode(HC12_SET, OUTPUT);  // start HC-12 RF transceiver
-    digitalWriteFast(HC12_SET, HIGH);
-    Serial1.begin(9600, SERIAL_8N1);
-    delay(10);
-    digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
-    delay(10);
-    tries = 1;
-    do {
-      if (++tries > 10) fatal_error(1); // E1 error
-      send_command("AT");  // wake it up
-    } while (!get_response("OK\x0d\x0a")); // try a bunch of times
-    send_command("AT+DEFAULT");
-    get_response(NULL);
-    send_command("AT+FU1"); // set FU1 mode: medium speed, 3.6 ma while active
-    get_response(NULL);
-    send_command("AT+C001"); // set channel 001: 433.4 Mhz
-    get_response(NULL);
-    if (DEBUG) {
-      send_command("AT+V");  // get version number
-      get_response(NULL);
-      send_command("AT+RX"); // get all parameters
-      get_response(NULL);
-    }
-    digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
-    delay(100); // wait a bit
-  }
-
-  packet.stx = STX;    // initialize the packet to send
-  packet.etx = ETX;
-  if (address_switches > 3) fatal_error(4);
-  for (int i = 0; i < 5; ++i) {  // flash our 1..4 zone number a few times
-    shownum(address_switches + 1, NOPOINTS, 500);
-    delay(500);
-  }
-  if (DEBUG) {
-    Serial.print("zone: ");
-    Serial.println(address_switches + 1);
-  }
-  packet.addr = address_switches; // store the address as 0..3
-  packet.type = 1;
-
-  if (TESTS) {  // display battery test point voltage
-    for (int i = 0; i < 5; ++i) {
-      uint32_t aval;
-      uint16_t volt_tenths;
-      aval = analogRead(BATTERY_PIN);
-      volt_tenths = aval * AREF_MV / (1023 * 100);
-      if (DEBUG) {
-        Serial.print("analog pin = ");
-        Serial.println(aval);
-        Serial.println(volt_tenths);
-      }
-      shownum(volt_tenths, POINT2, 500); // voltage in tenths
+   for (int i = 0; i < 3; ++i) { // announce our presence
+      digitalWrite(LED, LOW);
       delay(250);
-    }
-  }
-}
+      digitalWrite(LED, HIGH);
+      delay(250); }
+
+   if (DEBUG) { // display the switches and our node address
+      Serial.print("switches: ");
+      Serial.print(digitalRead(SW1) ? '1' : '0');
+      Serial.print(digitalRead(SW2) ? '1' : '0');
+      Serial.print("node addr: ");
+      Serial.println(node_addr); }
+
+   // Our power-management strategy is to keep everything turned off until we need to use it.
+   // (Should we also disable brown-out detection via the fuse?)
+
+   ADCSRA &= ~bit(ADEN);  // turn off ADCfirst; p.46: "The ADC must be disabled before shut down"
+   ACSR |= bit(ACD);      // turn off analog comparator
+   DIDR1 = bit(AIN1D) | bit(AIN0D); // disable analog comparator input buffers
+   PRR =
+      bit(PRTWI)      // turn off 2-wire interface (needed by the temp/humidity sensor)
+      | bit(PRSPI)    // turn off SPI (needed by the radio and the display)
+      | bit(PRADC)    // turn off the A-to-D converter (need by the battery monitor)
+      | (DEBUG ? 0 : bit(PRUSART0))  // turn of the USART if not debugging (used by the serial monitor)
+      | bit(PRTIM1)   // turn off timer/counter 1 (not used)
+      | bit(PRTIM2);  // turn off timer/counter 2 (not used)
+   // We leave out PRTIM0 to keep timer/counter 0 running for timekeeping: millis(), delay()
+   TCCR1B = 0;  // turn off 16-bit timer/counter 1
+   TCCR2B = 0;  // turn off 16-bit timer/counter 2
+
+   // We use tables 35-38 and 35-39 on page 607 to compensate for what we see as the
+   // typical internal RC oscillator frequency of 8.1 Mhz instead of 8.0 Mhz at 3.3V
+   // and 20C, or 1.2% fast. This isn't as important as our correction to the watchdog
+   // timer oscillator correction that comes later, but it can't hurt.
+   // (The notes at the beginning explain how to program CPU fuses so you can measure
+   //  the actual oscillator frequency with an oscilloscope.)
+   //   OSCCAL = 125; // 10.77 Mhz
+   //   OSCCAL = 86;  //  8.01 Mhz
+   //   OSCCAL = 85;  //  7.96 Mhz
+   //   OSCCAL = 83;  //  7.84 Mhz
+   //   OSCCAL = 80;  //  7.66 Mhz
+   //   OSCCAL = 64;  //  6.95 Mhz
+   // Note that 0 to 127 is the low range, and 128 to 255 is the high range.
+   // Why is the default 128 (0x80), the first point of the higher range?
+   // Shouldn't that always result in a frequency *less* than 8 Mhz?
+
+   OSCCAL = 86;  // 8.008 Mhz, typically
+
+   if (EPAPER) {
+      if (DEBUG) Serial.println("starting display");
+      turnon_SPI();
+      dsp_init(); // initialize display
+      dsp_start(true); // start in full update mode
+      dsp_clearmem();  // clear first page
+      dsp_displaymem(true);
+      dsp_clearmem();  // clear second page
+      dsp_displaymem(true);
+      if (DEBUG) Serial.println("display initialized");
+      dsp_start(false); // restart in partial update mode
+
+      char msg[25];   // show some configuration info
+
+      sprintf_P(msg, PSTR("vers %d.%01d"), VERSION / 10, VERSION % 10);
+      dsp_writestr(&font24, 24, 125, msg);
+      dsp_displaymem(true);
+      delay(1000);
+
+      dsp_writestr(&font24, 24, 125, (char *)__DATE__); // compile date
+      dsp_displaymem(true);
+      delay(1000);
+
+      turnon_ADC(); // current battery voltage
+      analogReference(DEFAULT);  // use the 3.3V reference for battery voltage check
+      uint16_t rawv = analogRead(BATTERY_PIN);
+      turnoff_ADC();
+      byte vx10 = (uint32_t)rawv * AREF_MV / (1023UL * 50); // voltage times 10 from VCC/2 network
+      if (DEBUG) {
+         Serial.print("raw battery voltage: "); Serial.println(rawv); }
+      sprintf_P(msg, PSTR("%d.%dV       "), vx10 / 10, vx10 % 10);
+      dsp_writestr(&font24, 24, 125, msg);
+      dsp_displaymem(true);
+      delay(1000);
+
+      sprintf_P(msg, PSTR("zone %d     "), node_addr + 1); // our zone number
+      dsp_writestr(&font24, 24, 125, msg);
+      dsp_displaymem(true);
+      delay(1000);
+
+      dsp_sleep(); // put the display into deep sleep
+      turnoff_SPI();
+      display_working = true;
+      if (DEBUG) Serial.println("display init done"); }
+
+   if (TEMPSENSOR) {
+      turnon_TWI();
+      Si7021_init();                   // initialize the temp sensor
+      if (DEBUG) Si7021_gettemphum();
+      turnoff_TWI(); }
+
+   if (RADIO) {
+      turnon_SPI();
+      RFradio_init(RF_CS_PIN, RF_RESET_PIN); // initialize the radio
+      turnoff_SPI();
+      if (DEBUG) Serial.println("radio initialized");
+      // dither the time between sends to avoid consistent collisions with other nodes
+      time_between_sends = TIME_BETWEEN_SENDS +  ((uint32_t)node_addr << 10); } }
 
 //-----------------------------------------------------------------------------------------------------------------
 //    The main loop
 //-----------------------------------------------------------------------------------------------------------------
 
-unsigned long send_data_time;
-void loop() {
-  int tries;
+void update_time(void) { // update datetime_now, based on elapsed time
+   uint32_t rightnow = millis();
+   datetime_now_millis += rightnow - datetime_now_update_time; // the msec deficit
+   // This should only loop at most 8 times, for an 8-second sleep, but it's faster than division
+   while (datetime_now_millis >= 1000) {
+      datetime_now_millis -= 1000;
+      if (++datetime_now.sec >= 60) {
+         datetime_now.sec -= 60;
+         if (++datetime_now.min >= 60) {
+            datetime_now.min -= 60;
+            if (++datetime_now.hour >= 24) {
+               datetime_now.hour -= 24;
+               ++datetime_now.date;
+               // Ignore the complicated rollover to the next month;
+               // the next packet we receive will fix it anyway.
+            } } } }
+   datetime_now_update_time = rightnow; }
 
-  // 1. Put the RF transmitter to sleep so it only uses about 22 uA of power
+void loop (void) {
 
-  if (TRANSMIT) {
-    digitalWriteFast(HC12_SET, LOW); // enter command mode
-    sleep_delay(10);
-    send_command("AT"); // the first command is ignored!
-    get_response(NULL);
-    do {
-      sleep_delay(10);
-      send_command("AT+SLEEP");
-    } while (!get_response("OK+SLEEP\x0d\x0a")); // ... might get "ERROR\x0d\0xa" if busy, so keep trying
-    if (DEBUG) {
-      Serial.print("send took "); Serial.print(millis() - send_data_time); Serial.println(" msec");;
-    }
-    digitalWriteFast(HC12_SET, HIGH);  // back to data mode
-    // hibernate_delay(10000); //TEMP  test power utilization
-  }
+   static bool neversent = true;
 
-  // 2. Display the temperature for a while, uisng hibernation waits to minimize power drain
+   static byte displayed_temp = 0;
+   static byte tempchange_countdown = 2;  // make sure temp is changed on both display pages
 
-  for (int loops = 0; loops < 10; ++loops) {  // 10 * 1.5 seconds: transmit every 15 seconds
-    HDC1000_gettemphum();  // get current temperature and humidity
-    shownum(current_temp, NOPOINTS, 500); // show temp for half a second
-    if (TESTS) shownum(current_humid, POINT1, 250);  // (briefly show humidity)
-    hibernate_delay(1000); // sleep for one second
-  }
+   static byte displayed_date = 0;
+   static byte datechange_countdown = 2;  // make sure date is changed on both display pages
 
-  // 3. Wake up the transmitter send a packet with the latest temperature
+   // check if it is time to read the temperature, send a packet, and get a response
 
-  if (TRANSMIT) {
-    hibernate_delay (100 * packet.addr); // "random" delay based on our address, to minimize collisions
-    packet.temperature = min(max(current_temp, 0), 120);
-    packet.humidity = min(max(current_humid, 0), 100);
-    packet.battery = (uint32_t)analogRead(BATTERY_PIN) * AREF_MV / (1023 * 50); // VCC/2 resistor network!
-    packet.lrc = 0;
-    for (int i = 0; i < sizeof(packet) - 1; ++i) packet.lrc ^= ((byte *)(&packet))[i];
-    digitalWriteFast(HC12_SET, LOW); // put HC-12 in command mode
-    // from here on we wait with the cpu in sleep mode instead of hibernate, to keep the
-    // transmitter active with the full 3.3V on the VDD pin
-    sleep_delay(10);
-    tries = 1;
-    do {
-      if (++tries > 10) fatal_error(2); // E2 error
-      send_command("AT");  // wake it up
-    } while (!get_response("OK\x0d\x0a")); // keep at it until it responds
-    digitalWriteFast(HC12_SET, HIGH); // put HC-12 in data mode
-    sleep_delay(50); // need this! 25 is not enough
-    if (DEBUG) {
-      Serial.print("send data packet #"); Serial.print(++count_sent_packets); Serial.print(": ");
-      for (int i = 0; i < sizeof(packet); ++i) {
-        Serial.print(((byte *)(&packet))[i], DEC);  Serial.print(' ');
+   if (neversent || millis() - last_send_time >= time_between_sends) { // (works ok at overflow)
+      xmt_pkt.addr = node_addr;
+      xmt_pkt.type = PT_TEMP;
+      xmt_pkt.sw_version = VERSION;
+      ++xmt_pkt.sequence;
+
+      MARKTIME(1);  //*** read the temperature and humidity
+      turnon_TWI();
+      Si7021_gettemphum();
+      xmt_pkt.temperature = current_temp;
+      xmt_pkt.humidity = current_humid;
+      turnoff_TWI();
+
+      MARKTIME(2);  //*** read the battery voltage
+      turnon_ADC();
+      analogReference(DEFAULT);  // use the 3.3V reference for battery voltage check
+      uint16_t rawv = analogRead(BATTERY_PIN);
+      turnoff_ADC();
+      xmt_pkt.battery = (uint32_t)rawv * AREF_MV / (1023UL * 50); // VCC/2 resistor network!
+
+      MARKTIME(3); //*** send the packet
+      turnon_SPI();
+      RFradio_transmit((byte *)&xmt_pkt, RF_TEMP_PKT_SIZE);
+
+      MARKTIME(4); //*** receive the response
+      RFradio_receive();
+      uint32_t starttime = millis();
+      enum RFERR error = RF_UNKNOWN;
+      while (1) {  // wait for the response packet
+         if (RFradio_gotpkt()) {
+            MARKTIME(5); //*** got the response
+            error = RFradio_getpkt((byte *)&rcv_pkt, RF_RESP_PKT_SIZE);
+            if (error == RF_OK) {
+               datetime_now = rcv_pkt.datetime;  // copy the packet's datetime
+               datetime_now_update_time = millis();
+               datetime_now_millis = 0; }
+            else {
+               MARKTIME(5);
+               MARKTIME(error);
+               // do something to display the receive packet error?
+            }
+            break; }
+         if (millis() - starttime > 75) { // msec to wait for packet
+            MARKTIME(5);
+            MARKTIME(RF_NOPKT);
+            // do something to display lack of response packet?
+            break; } //
       }
-      Serial.println();
-    }
-    Serial1.write((byte *)(&packet), sizeof(packet)); // send the packet data
-    Serial1.flush(); // wait for it all to go out
-    send_data_time = millis();
-    sleep_delay(10); // give it a time to start  ** was 50
-  }
+      RFradio_sleep();
+      turnoff_SPI();
+      last_send_time = millis();
+      neversent = false; //
+   } // send
+
+   // check if we need to update the display because the minute changed
+
+   update_time();
+   if (datetime_now.min != displayed_min) {
+      displayed_min = datetime_now.min; // the minute has changed
+      MARKTIME(6);  //*** write updated date/time/temp
+      turnon_SPI();
+      dsp_start(false); // partial update mode
+      if (datetime_now.date != displayed_date) // only write date if changed
+         datechange_countdown = 2;
+      if (datechange_countdown) { // but do it twice, for both display pages
+         writedate(&datetime_now); // write day and date
+         displayed_date = datetime_now.date;
+         --datechange_countdown; }
+      writetime(&datetime_now); // always write time
+      if (current_temp != displayed_temp) // only write temp if changed
+         tempchange_countdown = 2;
+      if (tempchange_countdown) { // but do it twice, for both display pages
+         char msg[25];
+         sprintf_P(msg, PSTR("%2d`"), min(current_temp, 99));
+         dsp_writestr(&font67, 16, 40, msg);  // write temperature
+         displayed_temp = current_temp;
+         --tempchange_countdown; }
+      MARKTIME(7); //*** update the display
+      dsp_displaymem(true);
+      dsp_sleep(); // put the display into deep sleep
+      turnoff_SPI(); }
+
+   // figure out how long we should sleep for
+
+   uint32_t time_to_next_minute_change = (60 - datetime_now.sec) * 1000;
+
+   uint32_t time_since_last_send = millis() - last_send_time;
+   // Think twice if you have a plan for how to simplify this calculation!
+   uint32_t time_to_next_send;
+   if (time_since_last_send >= time_between_sends)
+      time_to_next_send = 0;
+   else time_to_next_send = time_between_sends - time_since_last_send;
+
+   uint16_t sleep_time = min(time_to_next_send, time_to_next_minute_change);
+
+   // The watchdog oscillator tends to run slow! Table 35-10 on page 605, and
+   // our measurements, show that at 20C and 3.3V it typically is 118-124 Khz
+   // instead of 128 Khz, or 6-7% slow. That matters when we're not getting
+   // frequent clock updates from the receiver, since we have to adjust for
+   // the time during sleep when TIMER0 is not running. We thus adjust our
+   // sleep time numbers with the WD macro so that we're closer to real time.
+
+#define WDSPEED 122  // typical speed of watchdog oscillator in Khz
+#define WD(x) (uint16_t)((uint32_t)x*128/WDSPEED)
+
+   byte sleep_code; // WDP3, WDP2, WDP1, WDP0, but not in consecutive bits!
+   if (sleep_time >= WD(8000)) {
+      sleep_code = 0x21;  // 8 seconds is the most the processor can sleep
+      sleep_time = WD(8000); }
+   else if (sleep_time >= WD(4000)) {
+      sleep_code = 0x20;  // 4 seconds
+      sleep_time = WD(4000); }
+   else if (sleep_time >= WD(2000)) {
+      sleep_code = 0x07;  // 2 seconds
+      sleep_time = WD(2000); }
+   else if (sleep_time >= WD(1000)) {
+      sleep_code = 0x06;  // 1 seconds
+      sleep_time = WD(1000); }
+   else if (sleep_time >= WD(500)) {
+      sleep_code = 0x05;  // 0.5 seconds
+      sleep_time = WD(500); }
+   else if (sleep_time >= WD(250)) {
+      sleep_code = 0x04;  // 0.25 seconds
+      sleep_time = WD(250); }
+   else if (sleep_time >= WD(125)) {
+      sleep_code = 0x03;   // 0.125 sec
+      sleep_time = WD(125); }
+   else if (sleep_time >= WD(64)) {
+      sleep_code = 0x02;   // 64 msec
+      sleep_time = WD(64); }
+   else if (sleep_time >= WD(32)) {
+      sleep_code = 0x01;   // 32 msec
+      sleep_time = WD(32); }
+   else
+      sleep_code = 0;   // don't sleep for less than that; just delay
+
+   MARKTIME(8); //*** sleep
+   if (sleep_code == 0)
+      delay(sleep_time);  // delay instead of sleeping
+   else {
+      sleep(sleep_code);  // "deep sleep" hibernation; only the watchdog timer runs
+      noInterrupts (); {
+         extern volatile uint32_t timer0_millis;
+         timer0_millis += sleep_time; // approximate adjustment to the clock, which was stopped
+         interrupts(); } }
+
+   MARKTIME(9); //*** wake up
+   
+   //while(1) sleep(0x21); // for quiescent current measurement
+
 }
+
+//* tempsensor.ino
+
