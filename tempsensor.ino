@@ -30,8 +30,10 @@
      http://ww1.microchip.com/downloads/en/DeviceDoc/20005415D.pdf
    - 3-cell AAA battery holder
      https://www.digikey.com/product-detail/en/2479/36-2479-ND/303824
-   - 2-position slide switche to set the sensor address and mode
+   - 2-position slide switch to set the sensor address and mode
      https://www.digikey.com/product-detail/en/1825360-3/450-1781-ND/3283586
+   - a 2.1" x 2.7" 2-sided custom printed circuit board, made for $10 each by
+     https://oshpark.com/
    - 3" x 3" x 1.2" vented plastic enclosure
      https://www.ebay.com/itm/Z-123-WH-Enclosure-multipurpose-X75-8mm-Y78-8mm-Z30-2mm-vented-ABS-Z123BABS/401475260109
 
@@ -71,14 +73,20 @@
    An alternative would be to buy just the raw e-paper display and add the 19
    passive components described in the datasheet.
 
-   Tips for programming the "bare" ATMega328P:
+   Tips for programming the "bare" ATMega328P on our PC board:
       - A 2x3 pin header mates to the Adafruit USBTinyISP programmer,
         with the "power board" jumper removed.
       - Select the "USBTiny" programmer in the Aduino IDE tools/programmer menu.
          Then "Upload using programmer". May have to retry and/or power cycle
-         the board and/or the USBTinyISP; it's finicky.
+         the board and/or the USBTinyISP; it's finicky. Problems might be that the
+         ePaper display and/or RFradio might load the MISO and SCLK lines if they
+         are not initialized, or that you can't program when the CPU is in deep
+         sleep. Try programming immediately after resetting the board
+         but before it starts to go into deep sleep. Try having the batteries
+         installed, or not.
       - Also can use AVRDUDE to check and modify fuse settings to change the
-        clock or to make the clock appear on the CLKO pin.
+        clock, or to make the clock appear on the CLKO pin.
+         avrdude -c usbtiny -p m328
       - The board selection is "Arduino/Genuino Uno", but the boards.txt file
         has to be changed to allow the frequency to be set to 1 MHz, which is
         the default with the internal 8Mhz oscillator and 8x precaling.
@@ -146,9 +154,17 @@
    19 Dec 2015, V1.2, L. Shustek, Use zone 1..4 in displays.
                                   Read addr switches before going into sleep mode.
    05 Jul 2018, V2.0, L. Shustek, Reimplemented with completely different hardware for lower power.
+   12 Oct 2018, V2.1, L. Shustek, Test code for diagnosing possible battery read glitches.
+                                  Ignore the first A-to-D conversion after coming out of sleep,
+                                  because "the first conversion might give a wrong value" (p250)
+                                  might apply to that situation too.
+   01 Nov 2018, V2.2, L. Shustek, Well, that doesn't solve the problem; about once every 10 times
+                                  we get 3.5-3.7 volts from the A-to-D converter, and I don't know
+                                  why. So hack: use the highest of the last 3 values.
+   04 Feb 2019, V2.3, L. Shustek, Fix bug: must increment wday when we increment date on our own.
 
 *****************************************************************************************************/
-#define VERSION 20
+#define VERSION 23
 
 #define TIME_BETWEEN_SENDS 2*60*1000UL // Nominally 2 minutes. Should it depend on whether temp changed?
 //#define TIME_BETWEEN_SENDS 5*1000UL  // every 5 seconds, for antenna testing
@@ -165,7 +181,7 @@
 #include <Arduino.h>
 #include <Wire.h>       // I2C for Si7021 temperature/humidity sensor
 #include <SPI.h>        // SPI for ePaper display, and the RF Radio
-#include <RFradio.h>    // our RFM95 LoRa radio library
+#include <RFradio.h>    // our RFM95 LoRa radio library, in the Arduino library directory
 #include "display.h"    // e-paper display
 
 // pin assignments
@@ -194,6 +210,7 @@ byte current_humid = 0;    // percent, 0..100
 struct pkt_temp_t xmt_pkt; // the packet we send: temp, humidity, battery voltage
 struct pkt_resp_t rcv_pkt; // the packet we receive: date, time
 static bool display_working = false;
+byte batt_prev = 0, batt_prevprev = 0;
 
 //-----------------------------------------------------------------------------------------------------------------
 //  Temperature/humidity sensor routines
@@ -513,6 +530,7 @@ void update_time(void) { // update datetime_now, based on elapsed time
             datetime_now.min -= 60;
             if (++datetime_now.hour >= 24) {
                datetime_now.hour -= 24;
+               if (++datetime_now.wday > 7) datetime_now.wday = 1;
                ++datetime_now.date;
                // Ignore the complicated rollover to the next month;
                // the next packet we receive will fix it anyway.
@@ -520,6 +538,30 @@ void update_time(void) { // update datetime_now, based on elapsed time
    datetime_now_update_time = rightnow; }
 
 void loop (void) {
+
+   #if 0
+   // TEMP TEST CODE FOR BATTERY READ FAILURE
+   int row = 0;
+   unsigned long counter = 1;
+   while (1) {
+      turnon_ADC();
+      analogReference(DEFAULT);  // use the 3.3V reference for battery voltage check
+      uint16_t rawv = analogRead(BATTERY_PIN);
+      turnoff_ADC();
+      byte volts = (uint32_t)rawv * AREF_MV / (1023UL * 50); // VCC/2 resistor network!
+      if (volts < 40 || counter < 10) { // display a few, then only if battery voltage is too low
+         char msg[25];
+         turnon_SPI(); dsp_start(false); // partial update mode
+         sprintf_P(msg, PSTR("%5lu %d.%1dV"), counter % 100000L, volts / 10, volts % 10);
+         dsp_writestr(&font24, 8, row, msg); dsp_displaymem(true);
+         dsp_writestr(&font24, 8, row, msg); dsp_displaymem(true);
+         row += 24; if (row > 175) row = 0;
+         dsp_sleep(); turnoff_SPI(); // put the display into deep sleep
+      }
+      sleep(0x03); // 125 msec
+      if (++counter % (5000 / 125) == 0) { // flash LED every 5 seconds
+         digitalWrite(LED, LOW); delay(200); digitalWrite(LED, HIGH); } }
+   #endif
 
    static bool neversent = true;
 
@@ -549,7 +591,13 @@ void loop (void) {
       analogReference(DEFAULT);  // use the 3.3V reference for battery voltage check
       uint16_t rawv = analogRead(BATTERY_PIN);
       turnoff_ADC();
-      xmt_pkt.battery = (uint32_t)rawv * AREF_MV / (1023UL * 50); // VCC/2 resistor network!
+
+      byte batt = (uint32_t)rawv * AREF_MV / (1023UL * 50); // VCC/2 resistor network!
+      xmt_pkt.battery = batt; // use maximum of last three values, b/c occsionally it's bogus
+      if (batt_prev > xmt_pkt.battery) xmt_pkt.battery = batt_prev;
+      if (batt_prevprev > xmt_pkt.battery) xmt_pkt.battery = batt_prevprev;
+      batt_prevprev = batt_prev;
+      batt_prev = batt;
 
       MARKTIME(3); //*** send the packet
       turnon_SPI();
@@ -678,7 +726,7 @@ void loop (void) {
          interrupts(); } }
 
    MARKTIME(9); //*** wake up
-   
+
    //while(1) sleep(0x21); // for quiescent current measurement
 
 }
